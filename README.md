@@ -26,7 +26,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone <你的仓库地址>
+git clone https://github.com/majc888888/arrow-puzzle.git
 cd arrow-puzzle
 
 # 2. 安装依赖
@@ -58,8 +58,6 @@ python main.py
 │   └── ui.py            # Pygame 界面渲染、交互与动画
 ├── tests/
 │   └── test_game.py     # 自动化测试（覆盖 T01~T06）
-├── scripts/
-│   └── capture.py       # 界面截图生成脚本
 ├── assets/screenshots/  # 游戏截图
 ├── requirements.txt     # 依赖清单
 └── README.md
