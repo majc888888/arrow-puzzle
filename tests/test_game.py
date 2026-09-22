@@ -19,6 +19,7 @@ import pygame  # noqa: E402
 
 from game.core import (  # noqa: E402
     Arrow, UP, DOWN, LEFT, RIGHT, is_blocked, load_level, find_solution,
+    find_next_move,
 )
 from game.levels import LEVELS  # noqa: E402
 from game import ui  # noqa: E402
@@ -173,6 +174,132 @@ class GameFlowTest(unittest.TestCase):
         restored = [(a.row, a.col) for a in g.arrows]
         self.assertEqual(sorted(restored), sorted(original_arrows),
                          "箭头布局应恢复为初始状态")
+
+
+class ExtensionFeatureTest(unittest.TestCase):
+    """扩展功能：撤销、提示、星级、关卡解锁。"""
+
+    @classmethod
+    def setUpClass(cls):
+        pygame.init()
+        cls.screen = pygame.display.set_mode((ui.WINDOW_W, ui.WINDOW_H))
+
+    @classmethod
+    def tearDownClass(cls):
+        pygame.quit()
+
+    def _new_game(self, level_index=0):
+        g = ui.Game(self.screen)
+        g.load_level(level_index)
+        g.state = ui.STATE_PLAYING
+        return g
+
+    def _click(self, g, row, col):
+        g._click_arrow(row, col)
+
+    def _settle(self, g, seconds):
+        g.update(seconds)
+
+    def _clear_level(self, g, level_index):
+        """按求解顺序清空指定关卡。"""
+        rows, cols, arrows = load_level(LEVELS[level_index].grid)
+        for a in find_solution(arrows, rows, cols):
+            self._click(g, a.row, a.col)
+            self._settle(g, ui.FLY_DURATION + 0.1)
+
+    # ---- 撤销 ----
+    def test_undo_restores_fly_out(self):
+        """撤销一次成功飞出，箭头应恢复到场上。"""
+        g = self._new_game(0)
+        n_before = len(g.arrows)
+        self._click(g, 0, 0)                       # (0,0) 朝右，可飞
+        self._settle(g, ui.FLY_DURATION + 0.1)
+        self.assertEqual(len(g.arrows), n_before - 1)
+        g.undo()
+        self.assertEqual(len(g.arrows), n_before, "撤销后箭头应恢复")
+        self.assertEqual(len(g.history), 0, "历史栈应弹出到空")
+
+    def test_undo_restores_mistake(self):
+        """撤销一次碰撞，失误次数应恢复。"""
+        g = self._new_game(1)
+        self._click(g, 2, 0)                       # 碰撞
+        self._settle(g, ui.SHAKE_DURATION + 0.1)
+        self.assertEqual(g.mistakes, 2)
+        g.undo()
+        self.assertEqual(g.mistakes, 3, "撤销后失误次数应恢复")
+
+    def test_undo_after_game_over_returns_playing(self):
+        """失误耗尽进入失败后，撤销应能回到游戏状态。"""
+        g = self._new_game(1)
+        for _ in range(3):
+            self._click(g, 2, 0)
+            self._settle(g, ui.SHAKE_DURATION + 0.1)
+        self.assertEqual(g.state, ui.STATE_OVER)
+        g.undo()
+        self.assertEqual(g.state, ui.STATE_PLAYING, "撤销后应回到游戏状态")
+        self.assertEqual(g.mistakes, 1)
+
+    # ---- 提示 ----
+    def test_hint_marks_safe_arrow(self):
+        """提示应消耗次数并高亮一个确实可飞出的箭头。"""
+        g = self._new_game(0)
+        hints_before = g.hints_left
+        g.use_hint()
+        self.assertEqual(g.hints_left, hints_before - 1, "提示次数应减 1")
+        self.assertIsNotNone(g.hint_target, "应设置提示目标")
+        arrow = g.arrow_at(*g.hint_target)
+        self.assertFalse(is_blocked(arrow, g.occupied_positions(),
+                                    g.rows, g.cols),
+                         "被提示的箭头应确实可飞出")
+
+    def test_hint_exhausted_no_more(self):
+        """提示次数用完后，继续请求提示不应再消耗。"""
+        g = self._new_game(0)
+        for _ in range(3):
+            g.use_hint()
+        self.assertEqual(g.hints_left, 0)
+        g.use_hint()
+        self.assertEqual(g.hints_left, 0, "次数用尽后不应再变化")
+
+    def test_find_next_move_returns_unblocked(self):
+        """find_next_move 应返回一个前方无阻挡的箭头。"""
+        for lv in LEVELS:
+            rows, cols, arrows = load_level(lv.grid)
+            move = find_next_move(arrows, rows, cols)
+            self.assertIsNotNone(move, f"关卡 {lv.index} 应存在可飞出的箭头")
+            self.assertFalse(is_blocked(move, {a.pos for a in arrows},
+                                        rows, cols))
+
+    # ---- 星级与计时 ----
+    def test_stars_full_when_no_mistakes(self):
+        """无失误通关应得 3 星。"""
+        g = self._new_game(0)
+        self._clear_level(g, 0)
+        self.assertEqual(g.state, ui.STATE_CLEAR)
+        self.assertEqual(g.clear_stars, 3, "无失误通关应为 3 星")
+        self.assertGreaterEqual(g.clear_time, 0, "应记录通关用时")
+
+    def test_stars_reduced_by_mistakes(self):
+        """有失误通关，星级应相应降低。"""
+        g = self._new_game(1)
+        self._click(g, 2, 0)                       # 先制造 1 次失误
+        self._settle(g, ui.SHAKE_DURATION + 0.1)
+        self._clear_level(g, 1)
+        self.assertEqual(g.state, ui.STATE_CLEAR)
+        self.assertEqual(g.clear_stars, 2, "1 次失误通关应为 2 星")
+
+    # ---- 关卡解锁 ----
+    def test_unlock_progress_after_clear(self):
+        """通关后应解锁下一关。"""
+        g = self._new_game(0)
+        self.assertEqual(g.unlocked, 1)
+        self._clear_level(g, 0)
+        g._next_level()
+        self.assertEqual(g.unlocked, 2, "通关第 1 关后应解锁第 2 关")
+
+    def test_eight_levels_available(self):
+        """扩展后应有 8 个关卡且全部可通关。"""
+        self.assertEqual(len(LEVELS), 8, "应共有 8 个关卡")
 
 
 if __name__ == "__main__":
