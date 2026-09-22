@@ -76,6 +76,9 @@ python -m unittest discover -s tests -v
 ### 开始界面
 ![开始界面](assets/screenshots/start.png)
 
+### 关卡选择
+![关卡选择](assets/screenshots/select.png)
+
 ### 游戏界面
 ![游戏界面](assets/screenshots/playing.png)
 
