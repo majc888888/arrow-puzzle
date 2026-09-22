@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 import pygame
 
-from .core import (Arrow, is_blocked, load_level, DIR_NAME,
-                   UP, DOWN, LEFT, RIGHT)
+from .core import (Arrow, is_blocked, load_level, find_next_move,
+                   DIR_NAME, UP, DOWN, LEFT, RIGHT)
 from .levels import LEVELS, Level
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,9 @@ TEXT_SUB = (107, 114, 128)            # 次要文字
 ARROW_COLOR = (47, 107, 255)          # 箭头默认（蓝）
 ARROW_FLY = (34, 197, 94)             # 飞出（绿）
 ARROW_BLOCKED = (255, 77, 79)         # 碰撞（红）
+HINT_COLOR = (255, 165, 0)            # 提示高亮（橙）
+STAR_COLOR = (255, 193, 7)            # 星级（金）
+LOCKED_COLOR = (203, 208, 218)        # 锁定关卡底色（灰）
 BUTTON_COLOR = (47, 107, 255)         # 按钮底
 BUTTON_HOVER = (64, 128, 255)         # 按钮悬停
 BUTTON_TEXT = (255, 255, 255)
@@ -158,6 +162,7 @@ STATE_PLAYING = "playing"
 STATE_CLEAR = "clear"      # 单关通关
 STATE_OVER = "over"        # 失败
 STATE_ALL_CLEAR = "all_clear"
+STATE_LEVEL_SELECT = "level_select"   # 关卡选择
 
 
 class Game:
@@ -176,6 +181,16 @@ class Game:
         self.shaking: List[ShakeAnim] = []
         self.flash_timer = 0.0          # 碰撞提示文字剩余时间
 
+        # 扩展功能相关状态
+        self.history: List[Tuple[List[Arrow], int]] = []  # 撤销栈：(箭头快照, 失误数)
+        self.hints_left = 3             # 本关剩余提示次数
+        self.hint_target: Optional[Tuple[int, int]] = None  # 被高亮的箭头位置
+        self.start_time = 0.0           # 本关计时起点（秒）
+        self.elapsed = 0.0              # 本关已用时（秒）
+        self.clear_time = 0.0           # 通关时的用时（结果面板展示）
+        self.clear_stars = 0            # 通关星级（1~3）
+        self.unlocked = 1               # 已解锁的最高关卡序号（1 起）
+
         # 棋盘布局（像素）
         self.cell = 0
         self.board_rect = pygame.Rect(0, 0, 0, 0)
@@ -184,8 +199,13 @@ class Game:
         self.btn_restart = pygame.Rect(0, 0, 180, 52)
         self.btn_next = pygame.Rect(0, 0, 180, 52)
         self.btn_start = pygame.Rect(0, 0, 200, 60)
-        # 开始按钮在开始界面/全部通关界面使用，初始化时即定位（居中）
-        self.btn_start.center = (WINDOW_W // 2, 430)
+        self.btn_select = pygame.Rect(0, 0, 200, 60)   # 开始界面「选择关卡」
+        self.btn_undo = pygame.Rect(0, 0, 150, 48)     # 撤销
+        self.btn_hint = pygame.Rect(0, 0, 150, 48)     # 提示
+        self.btn_back = pygame.Rect(0, 0, 150, 48)     # 选关界面「返回」
+        self.level_buttons: List[pygame.Rect] = []     # 选关界面的关卡按钮
+
+        self._layout_buttons()
 
     # ------------------------------------------------------------------
     # 状态切换
@@ -203,6 +223,13 @@ class Game:
         self.flying = []
         self.shaking = []
         self.flash_timer = 0.0
+        self.history = []
+        self.hints_left = 3
+        self.hint_target = None
+        self.elapsed = 0.0
+        self.clear_time = 0.0
+        self.clear_stars = 0
+        self.start_time = time.time()
         self._compute_layout()
 
     def restart_level(self):
@@ -223,9 +250,35 @@ class Game:
         by = top + (avail_h - board_h) // 2
         self.board_rect = pygame.Rect(bx, by, board_w, board_h)
 
+    def _layout_buttons(self):
+        """统一布局所有固定位置的按钮。"""
+        # 底部一排（游戏界面 / 失败界面）
+        self.btn_undo.center = (WINDOW_W // 2 - 210, WINDOW_H - 52)
         self.btn_restart.center = (WINDOW_W // 2, WINDOW_H - 52)
+        self.btn_hint.center = (WINDOW_W // 2 + 210, WINDOW_H - 52)
         self.btn_next.center = (WINDOW_W // 2, WINDOW_H - 90)
-        self.btn_start.center = (WINDOW_W // 2, WINDOW_H - 140)
+        # 开始界面
+        self.btn_start.center = (WINDOW_W // 2, 400)
+        self.btn_select.center = (WINDOW_W // 2, 480)
+        # 选关界面
+        self.btn_back.center = (WINDOW_W // 2, WINDOW_H - 60)
+        self._layout_level_buttons()
+
+    def _layout_level_buttons(self):
+        """布局选关界面的关卡按钮网格。"""
+        self.level_buttons = []
+        n = len(LEVELS)
+        cols = 4
+        bw, bh = 130, 92
+        gap_x, gap_y = 28, 22
+        total_w = cols * bw + (cols - 1) * gap_x
+        start_x = (WINDOW_W - total_w) // 2
+        start_y = 190
+        for i in range(n):
+            r, c = divmod(i, cols)
+            x = start_x + c * (bw + gap_x)
+            y = start_y + r * (bh + gap_y)
+            self.level_buttons.append(pygame.Rect(x, y, bw, bh))
 
     # ------------------------------------------------------------------
     # 坐标换算
@@ -267,9 +320,17 @@ class Game:
         if self.state == STATE_START:
             if self.btn_start.collidepoint(pos):
                 self.start_game()
+            elif self.btn_select.collidepoint(pos):
+                self.state = STATE_LEVEL_SELECT
         elif self.state == STATE_PLAYING:
             if self.btn_restart.collidepoint(pos):
                 self.restart_level()
+                return None
+            if self.btn_undo.collidepoint(pos):
+                self.undo()
+                return None
+            if self.btn_hint.collidepoint(pos):
+                self.use_hint()
                 return None
             cell = self.pos_to_cell(*pos)
             if cell is not None:
@@ -283,6 +344,16 @@ class Game:
         elif self.state == STATE_ALL_CLEAR:
             if self.btn_start.collidepoint(pos):
                 self.start_game()
+        elif self.state == STATE_LEVEL_SELECT:
+            if self.btn_back.collidepoint(pos):
+                self._layout_buttons()  # 恢复开始界面按钮位置
+                self.state = STATE_START
+                return None
+            for i, rect in enumerate(self.level_buttons):
+                if rect.collidepoint(pos) and i + 1 <= self.unlocked:
+                    self.load_level(i)
+                    self.state = STATE_PLAYING
+                    break
         return None
 
     def _click_arrow(self, row: int, col: int):
@@ -292,6 +363,10 @@ class Game:
         # 动画中的箭头不响应点击
         if any(a.arrow == arrow for a in self.shaking):
             return
+        # 记录快照，供撤销使用
+        self.history.append((list(self.arrows), self.mistakes))
+        # 点击后清除提示高亮
+        self.hint_target = None
         if is_blocked(arrow, self.occupied_positions(), self.rows, self.cols):
             # 碰撞：晃动 + 变红 + 扣失误
             self.shaking.append(ShakeAnim(arrow))
@@ -305,12 +380,39 @@ class Game:
             self.arrows.remove(arrow)
             self.flying.append(FlyAnim(arrow))
 
+    def undo(self):
+        """撤销上一步操作，恢复箭头布局与失误次数。"""
+        if not self.history:
+            return
+        arrows, mistakes = self.history.pop()
+        self.arrows = arrows
+        self.mistakes = mistakes
+        self.flying = []
+        self.shaking = []
+        self.flash_timer = 0.0
+        self.hint_target = None
+        # 若因失误耗尽进入失败状态，撤销后应回到游戏中
+        if self.state == STATE_OVER:
+            self.state = STATE_PLAYING
+
+    def use_hint(self):
+        """消耗一次提示机会，高亮一个可安全飞出的箭头。"""
+        if self.hints_left <= 0:
+            return
+        arrow = find_next_move(self.arrows, self.rows, self.cols)
+        if arrow is None:
+            return
+        self.hint_target = arrow.pos
+        self.hints_left -= 1
+
     def _next_level(self):
         if self.level_index + 1 < len(LEVELS):
             self.load_level(self.level_index + 1)
             self.state = STATE_PLAYING
         else:
             self.state = STATE_ALL_CLEAR
+        # 更新已解锁进度
+        self.unlocked = max(self.unlocked, self.level_index + 1)
 
     # ------------------------------------------------------------------
     # 逐帧更新
@@ -318,6 +420,8 @@ class Game:
     def update(self, dt: float):
         if self.state != STATE_PLAYING:
             return
+        if self.arrows:
+            self.elapsed = time.time() - self.start_time
         for f in self.flying:
             f.t += dt
         self.flying = [f for f in self.flying if f.t < FLY_DURATION]
@@ -328,6 +432,9 @@ class Game:
             self.flash_timer -= dt
         # 通关判定：场上已无箭头且飞出动画结束
         if self.state == STATE_PLAYING and not self.arrows and not self.flying:
+            self.clear_time = self.elapsed
+            # 剩余失误数即星级（1~3）：0 失误得 3 星，2 失误得 1 星
+            self.clear_stars = max(1, self.mistakes)
             self.state = STATE_CLEAR
 
     # ------------------------------------------------------------------
@@ -345,6 +452,8 @@ class Game:
             self._draw_over()
         elif self.state == STATE_ALL_CLEAR:
             self._draw_all_clear()
+        elif self.state == STATE_LEVEL_SELECT:
+            self._draw_level_select()
 
     def _draw_start(self):
         draw_text(self.surface, "一箭又一箭", 64, (30, 64, 175),
@@ -353,6 +462,7 @@ class Game:
                   center=(WINDOW_W // 2, 220))
         self._draw_legend(WINDOW_W // 2, 300)
         draw_button(self.surface, self.btn_start, "开始游戏", size=30)
+        draw_button(self.surface, self.btn_select, "选择关卡", size=30)
 
     def _draw_legend(self, cx: int, cy: int):
         """在开始界面绘制玩法说明图例。"""
@@ -374,15 +484,21 @@ class Game:
         draw_text(self.surface, f"剩余失误：{self.mistakes}", 24,
                   (255, 77, 79) if self.mistakes <= 1 else TEXT_MAIN,
                   topright=(WINDOW_W - 32, 24))
+        draw_text(self.surface, f"用时 {int(self.elapsed)}s", 20, TEXT_SUB,
+                  center=(WINDOW_W // 2, 78))
+        draw_text(self.surface, f"提示 {self.hints_left}", 20, TEXT_SUB,
+                  topright=(WINDOW_W - 32, 64))
 
         # 碰撞提示文字
         if self.flash_timer > 0:
             alpha = int(255 * min(1.0, self.flash_timer / 0.4))
             draw_text(self.surface, "路径被阻挡！", 30, (220, 38, 38),
-                      center=(WINDOW_W // 2, 86))
+                      center=(WINDOW_W // 2, 112))
 
         self._draw_board()
+        draw_button(self.surface, self.btn_undo, "撤销", size=22)
         draw_button(self.surface, self.btn_restart, "重新开始", size=24)
+        draw_button(self.surface, self.btn_hint, "提示", size=22)
 
     def _draw_board(self):
         # 棋盘底板
@@ -405,6 +521,11 @@ class Game:
             cx, cy = self.cell_center(a.row, a.col)
             if a in shaking_set:
                 continue  # 晃动中的箭头单独绘制
+            if a.pos == self.hint_target:
+                # 提示高亮：橙色光圈
+                radius = int(self.cell * 0.42)
+                pygame.draw.circle(self.surface, HINT_COLOR, (cx, cy),
+                                   radius, 4)
             draw_arrow(self.surface, cx, cy, a.direction, self.cell,
                        ARROW_COLOR)
         # 晃动中的箭头（变红 + 抖动）
@@ -449,7 +570,12 @@ class Game:
         self._draw_board()
         is_last = self.level_index + 1 >= len(LEVELS)
         nxt = "全部通关！" if is_last else "进入下一关"
-        self._draw_result_panel("通关！", "太棒了，本关箭头已全部飞出", (34, 197, 94))
+        mistakes_used = self.level.max_mistakes - self.mistakes
+        subtitle = f"用时 {int(self.clear_time)} 秒 · 失误 {mistakes_used} 次"
+        self._draw_result_panel("通关！", subtitle, (34, 197, 94))
+        star_str = "★" * self.clear_stars + "☆" * (3 - self.clear_stars)
+        draw_text(self.surface, star_str, 52, STAR_COLOR,
+                  center=(WINDOW_W // 2, WINDOW_H // 2 + 60))
         draw_button(self.surface, self.btn_next, nxt, size=26)
 
     def _draw_over(self):
@@ -461,6 +587,26 @@ class Game:
         self._draw_result_panel("全部通关", "恭喜！你已通过所有关卡", (30, 64, 175))
         self.btn_start.center = (WINDOW_W // 2, WINDOW_H // 2 + 90)
         draw_button(self.surface, self.btn_start, "再玩一次", size=26)
+
+    def _draw_level_select(self):
+        draw_text(self.surface, "选择关卡", 44, (30, 64, 175),
+                  center=(WINDOW_W // 2, 100))
+        draw_text(self.surface, "灰色为未解锁关卡，通关当前关即可解锁下一关",
+                  20, TEXT_SUB, center=(WINDOW_W // 2, 148))
+        for i, rect in enumerate(self.level_buttons):
+            locked = i + 1 > self.unlocked
+            if locked:
+                pygame.draw.rect(self.surface, LOCKED_COLOR, rect,
+                                 border_radius=12)
+                draw_text(self.surface, f"第 {i + 1} 关", 26, (150, 155, 165),
+                          center=rect.center)
+            else:
+                hovered = rect.collidepoint(pygame.mouse.get_pos())
+                bg = BUTTON_HOVER if hovered else BUTTON_COLOR
+                pygame.draw.rect(self.surface, bg, rect, border_radius=12)
+                draw_text(self.surface, f"第 {i + 1} 关", 26, BUTTON_TEXT,
+                          center=rect.center)
+        draw_button(self.surface, self.btn_back, "返回", size=24)
 
 
 # ---------------------------------------------------------------------------
