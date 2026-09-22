@@ -134,6 +134,23 @@ def find_solution(
     return dfs(occupied, remaining, [])
 
 
+def find_next_move(
+    arrows: List[Arrow],
+    rows: int,
+    cols: int,
+) -> Optional[Arrow]:
+    """返回当前棋盘上任意一个「可安全飞出」的箭头（用于提示功能）。
+
+    遍历所有仍在场的箭头，返回第一个前方无阻挡者；若没有可飞出的箭头
+    （理论上只会在空棋盘或不可解局面出现），返回 None。
+    """
+    occupied: Set[Tuple[int, int]] = {a.pos for a in arrows}
+    for a in arrows:
+        if not is_blocked(a, occupied, rows, cols):
+            return a
+    return None
+
+
 def level_is_solvable(grid: List[str]) -> bool:
     """判断一个字符串关卡是否存在可行通关顺序。"""
     rows, cols, arrows = load_level(grid)
